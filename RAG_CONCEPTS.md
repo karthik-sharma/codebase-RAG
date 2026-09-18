@@ -21,15 +21,15 @@ same way, so the gap is understandable and not just a checklist item.*
   8. [Contextual chunk enrichment](#8-contextual-chunk-enrichment)
   9. [Index idempotency & stable IDs](#9-index-idempotency--stable-ids)
   10. [Ingestion-time data governance](#10-ingestion-time-data-governance)
+  11. [Incremental indexing](#11-incremental-indexing)
+  12. [Retrieval & generation evaluation](#12-retrieval--generation-evaluation)
 - [Part 3 — Concepts this repo does NOT implement yet](#part-3--concepts-this-repo-does-not-implement-yet)
   1. [Multi-tenant / multi-project indexing](#1-multi-tenant--multi-project-indexing)
-  2. [Incremental indexing](#2-incremental-indexing)
-  3. [Retrieval & generation evaluation](#3-retrieval--generation-evaluation)
-  4. [Observability / tracing](#4-observability--tracing)
-  5. [Hallucination / faithfulness guardrails](#5-hallucination--faithfulness-guardrails)
-  6. [Broader language coverage for chunking](#6-broader-language-coverage-for-chunking)
-  7. [Productization (CLI)](#7-productization-cli)
-  8. [The generator model itself is a ceiling](#8-the-generator-model-itself-is-a-ceiling)
+  2. [Observability / tracing](#2-observability--tracing)
+  3. [Hallucination / faithfulness guardrails (at answer time)](#3-hallucination--faithfulness-guardrails-at-answer-time)
+  4. [Broader language coverage for chunking](#4-broader-language-coverage-for-chunking)
+  5. [Productization (CLI)](#5-productization-cli)
+  6. [The generator model itself is a ceiling](#6-the-generator-model-itself-is-a-ceiling)
 - [Quick reference table](#quick-reference-table)
 
 ---
@@ -126,6 +126,13 @@ search, merging results by a shared `chunk_id` (see [§9](#9-index-idempotency--
 rather than the library's default of matching on exact `page_content` text, which is
 more fragile.
 
+**A known gap, found via the eval harness ([§12](#12-retrieval--generation-evaluation))**:
+this stage — and the reranker after it — can still be fooled when a *concept* in the
+question (e.g. "login") is also, coincidentally, close to unrelated file/component names
+(`Login.jsx`, `Login.css`). Hybrid search and RRF fuse two *retrieval* signals; neither
+one disambiguates "the behavior of logging in" from "things literally named Login." Not
+yet fixed.
+
 ### 4. Chunking strategy
 
 **The concept**: neither embedding models nor LLM prompts work well on whole files —
@@ -196,7 +203,7 @@ whole point of building a retrieval pipeline is undermined if the model ignores 
 answers from memory anyway. This is done through prompt instructions ("answer only using
 the provided context," "cite the source for every fact") — necessary, but *not*
 sufficient on its own, since nothing enforces the model actually follows those
-instructions (see [§5 in Part 3](#5-hallucination--faithfulness-guardrails)).
+instructions (see [§3 in Part 3](#3-hallucination--faithfulness-guardrails-at-answer-time)).
 
 **In this repo**: the prompt built in `answer_question` (`generate.py`) requires: answer
 only from context, cite the source file for *every* fact used (explicitly not just one,
@@ -229,14 +236,24 @@ almost all of them — code changes) needs either (a) a full-rebuild strategy (w
 everything, re-add from scratch) or (b) stable IDs so a second add can correctly replace
 the first instead of duplicating it. Stable IDs are also what let results computed by
 *different* retrieval methods (lexical, semantic) be recognized as "the same underlying
-item" when merging their rankings.
+item" when merging their rankings — and, further, what makes *targeted* updates
+(§11 — re-add just one file's chunks) possible at all.
 
-**In this repo**: currently strategy (a) — `vector_store.reset_collection()` wipes the
-whole collection before every ingestion, guaranteeing the same output whether you run
-ingestion once or fifty times. Separately, a `chunk_id` (`file:index`) is computed once
-in `chunk_documents.py` and reused identically in `chunks.json`, Chroma's metadata, and
-the BM25 index — this is what lets `EnsembleRetriever` correctly merge a BM25 hit and a
-semantic hit for the same underlying chunk (§3).
+A sharp edge worth knowing generally, not just here: passing a stable ID string in your
+own application code is not the same as that string actually becoming the database's
+real internal ID — most vector stores (Chroma included) will silently auto-generate
+their own ID unless you explicitly tell the client "use *this* ID," at which point any
+ID-based delete/update you attempt later using your own scheme will quietly match
+nothing.
+
+**In this repo**: strategy (b) — a `chunk_id` (`file:chunk_index`, where `chunk_index`
+is scoped to that file, not a global position — see §11) is computed once in
+`chunk_documents.py` and passed explicitly as `ids=` on every `vector_store.add_documents()`
+call, so it becomes Chroma's actual internal document ID, not just applicaton-level
+metadata. The same `chunk_id` is reused identically in `chunks.json` and the BM25 index
+— this is what lets `EnsembleRetriever` correctly merge a BM25 hit and a semantic hit
+for the same underlying chunk (§3), and what lets ingestion delete exactly the right
+chunks when a file changes (§11).
 
 ### 10. Ingestion-time data governance
 
@@ -252,6 +269,75 @@ target project (not just a hand-maintained guess at what's unsafe), using real g
 pattern semantics via the `pathspec` library — see `ARCHITECTURE.md §5.1` for the full
 mechanism, including the nested-`.gitignore` case that a simpler "check one root file"
 approach would have missed.
+
+### 11. Incremental indexing
+
+**The concept**: re-embedding an entire corpus from scratch on every update doesn't
+scale — the standard approach is to detect *what changed* since the last index build
+(via a content hash or modification timestamp per file), and only re-chunk/re-embed/
+upsert those changed files, while also detecting and removing chunks for files that were
+deleted entirely. This requires stable, targeted-deletable chunk IDs (§9) as a genuine
+prerequisite, not just a nice-to-have — you can't correctly "replace just this file's
+chunks" without a reliable way to identify exactly which stored entries belong to that
+file and only that file.
+
+**In this repo**: a manifest (`index_manifest.json`, `{file_path: content_hash}`,
+SHA-256) is written after every ingestion run. The next run hashes every current file
+and compares: an unchanged file's previously-computed chunks are reused outright (no
+re-chunking, no re-embedding); a new or changed file is re-chunked, its old chunk IDs
+(if any) are deleted from Chroma, and its fresh chunks are added; a file that's vanished
+since the last run has its old chunk IDs deleted and is dropped from the manifest. The
+very first run (no manifest yet) is always a full scan + full rebuild — both a
+legitimate bootstrap case and, in practice, an automatic migration path whenever the
+chunk-ID scheme itself changes underneath (which happened once already — see
+`ARCHITECTURE.md §6.4`).
+
+**A real, two-part bug found while building this** (worth knowing as a case study in
+why "add incremental logic" is rarely just adding a diff check): first, the existing
+`chunk_id` scheme turned out to be a *global* list position, not scoped per file — stable
+under a full-rebuild-always strategy, but silently unstable the moment one file's chunk
+count could change independently of others. Second, and more subtly, `chunk_id` had
+never actually been passed to Chroma as the real document ID at all (§9's "sharp edge") —
+so even after fixing the ID scheme, targeted deletes matched nothing until `ids=` was
+passed explicitly on every add. Neither of these was visible under the old
+full-wipe-and-rebuild strategy; both were only discoverable by actually building and
+testing the incremental path, not by inspecting the old code for correctness.
+
+### 12. Retrieval & generation evaluation
+
+**The concept**: "does this look right" on one or two manually-typed queries is not
+measurement — it can't detect a regression introduced by a later change, and it doesn't
+generalize past whatever you happened to type. A real evaluation setup has two halves:
+
+- **Retrieval metrics** — given a fixed set of `(question, correct chunk/file)` pairs,
+  compute things like **Precision@k** (of the top k retrieved, how many are actually
+  relevant), **Recall@k** (of all truly relevant chunks, how many made it into the top
+  k), and **MRR** (Mean Reciprocal Rank — how high up the *first* correct result appears,
+  averaged across many questions). (A fuller framework would also compute **NDCG**,
+  Normalized Discounted Cumulative Gain, which extends this to *graded* relevance — some
+  results more relevant than others rather than a binary yes/no — but that needs richer,
+  hand-labeled test data than a first version needs to be useful.)
+- **Generation metrics** — given the retrieved context and the model's answer,
+  **faithfulness** (is every claim in the answer actually supported by the provided
+  context, or invented) and **answer relevance** (does the answer actually address the
+  question asked). Frameworks like RAGAS formalize exactly this pair of measurements,
+  typically via an LLM acting as an automated judge.
+
+**In this repo**: `app/rag/eval.py` — a fixed `EVAL_CASES` list of
+`(question, expected_files)` pairs run against `hybrid_search()` directly, scored for
+**Hit Rate**, **Precision@k**, **Recall@k**, and **MRR**; plus a **faithfulness**
+check that runs the real `answer_question()` from `generate.py` and then makes a
+*separate* LLM call asking whether the answer's claims are actually supported by the
+retrieved context.
+
+**Why this immediately paid for itself**: the very first real run surfaced two genuine
+findings a single manual query would very plausibly have missed — a retrieval confusion
+between the *concept* "login" and the *literal filenames* `Login.jsx`/`Login.css` (§3's
+known gap), and evidence that the faithfulness judge itself isn't fully reliable at this
+model's scale (it once flagged an answer as unsupported by claiming a word was missing
+from context that was, on inspection, actually present). Both are now known, recorded
+limitations instead of invisible ones — which is exactly what an eval harness is for:
+not fixing quality, but making its actual state visible and re-checkable.
 
 ---
 
@@ -270,83 +356,49 @@ query filters on. Without this, ingesting a second corpus either mixes its data 
 first (polluting results) or, worse, silently destroys the first.
 
 **Why it matters here**: there is currently exactly one Chroma collection
-(`"codebase"|`), and ingestion resets it completely (§9 above). Ingesting Project B today
-**deletes** Project A's index outright — this is the most structurally important gap to
-close before this tool could reasonably be used across more than one project without
-re-ingesting the previous one every time you switch back.
+(`"codebase"`). Incremental indexing (§11 in Part 2) means a same-project re-ingest no
+longer wipes anything unnecessarily, but ingesting a genuinely *different* project still
+either mixes its chunks into the same collection as whatever was ingested before, or (on
+a bootstrap run, if the manifest happens to be absent) wipes it outright. This is the
+most structurally important gap left to close before this tool could reasonably be used
+across more than one project without deliberately managing that overlap yourself.
 
-### 2. Incremental indexing
-
-**The concept**: re-embedding an entire corpus from scratch on every update doesn't
-scale — the standard approach is to detect *what changed* (via file modification
-timestamps, or a content hash per file/chunk) since the last index build, and only
-re-chunk/re-embed/upsert those changed files, while also detecting and removing chunks
-for files that were deleted entirely. This requires stable chunk IDs (§9) as a
-prerequisite — you can't upsert "the chunk that used to be `app.py`'s third function" if
-you have no way to recognize it as the same chunk across two ingestion runs whose
-function count might have changed.
-
-**Why it matters here**: every `ingestion.py` run currently re-embeds *everything*,
-regardless of how much of the project actually changed since last time. Fine for a
-small demo project; would become genuinely slow on a large real codebase re-indexed
-frequently.
-
-### 3. Retrieval & generation evaluation
-
-**The concept**: "does this look right" on one or two manually-typed queries is not
-measurement — it can't detect a regression introduced by a later change, and it doesn't
-generalize past whatever you happened to type. A real evaluation setup has two halves:
-
-- **Retrieval metrics** — given a fixed set of `(question, correct chunk/file)` pairs,
-  compute things like **Precision@k** (of the top k retrieved, how many are actually
-  relevant), **Recall@k** (of all truly relevant chunks, how many made it into the top
-  k), **MRR** (Mean Reciprocal Rank — how high up the *first* correct result appears,
-  averaged across many questions), and **NDCG** (Normalized Discounted Cumulative Gain —
-  like MRR but accounts for multiple correct results per question and rewards them
-  appearing higher, not just present).
-- **Generation metrics** — given the retrieved context and the model's answer,
-  **faithfulness** (is every claim in the answer actually supported by the provided
-  context, or invented), **answer relevance** (does the answer actually address the
-  question asked), and **context precision/recall** (did retrieval provide the right
-  material for the model to work with in the first place). Frameworks like RAGAS
-  formalize exactly this pair of measurements.
-
-**Why it matters here**: every change made to this pipeline (the BM25/EnsembleRetriever
-swap, adding reranking, tightening the citation prompt) was validated by manually typing
-a handful of questions and reading the output — which can tell you something *improved*
-on that one example, but can't tell you it didn't *regress* something else, and can't be
-re-run automatically the next time something changes.
-
-### 4. Observability / tracing
+### 2. Observability / tracing
 
 **The concept**: production RAG systems log every query's full trace — what was
 retrieved (and each candidate's scores), what the final assembled prompt looked like,
 and what the model answered — so a bad answer can be debugged *after the fact* from the
 log, instead of only being diagnosable by reproducing it live. This logged history is
-also directly where a real evaluation set (§3) usually comes from: real queries a user
-actually asked, with their outcomes, curated into test cases over time. Hosted tools
-like LangSmith/Langfuse do this for you; a local-first equivalent would just be writing
-each trace to a local SQLite file or JSONL log.
+also directly where a real evaluation set (§12 in Part 2) usually comes from in a mature
+system: real queries a user actually asked, with their outcomes, curated into test cases
+over time. Hosted tools like LangSmith/Langfuse do this for you; a local-first
+equivalent would just be writing each trace to a local SQLite file or JSONL log.
 
 **Why it matters here**: every debugging session in this project so far has required
 re-running a query live to see what happened — there's no record of any past query,
-what was retrieved for it, or what was answered.
+what was retrieved for it, or what was answered. The eval set in §12 was hand-written
+for exactly this reason — there was no logged history to mine it from.
 
-### 5. Hallucination / faithfulness guardrails
+### 3. Hallucination / faithfulness guardrails (at answer time)
 
 **The concept**: telling a model "only use the provided context" (§7 in Part 2) is a
 request, not an enforcement mechanism — nothing stops the model from ignoring it. A
 faithfulness guardrail is a *separate*, automated check run *after* generation: either
 an NLI-style (natural language inference) model checking whether each sentence in the
 answer is logically entailed by the retrieved context, or a second LLM call acting as a
-judge ("does this answer's claims all appear in this context — yes/no, and which claims
-don't"). This catches the model quietly answering from its own training data instead of
-the retrieved material, which prompt instructions alone cannot guarantee against.
+judge. `eval.py` (§12 in Part 2) already builds this exact mechanism — but only as an
+*offline* scoring signal, run manually against a fixed test set, not as a live check on
+every real answer a user actually sees.
 
-**Why it matters here**: nothing currently verifies that an answer actually stayed
-grounded in what was retrieved — only the prompt's instructions ask for it.
+**Why it matters here**: nothing currently verifies, during an actual `generate.py`
+session, that an answer stayed grounded in what was retrieved — the faithfulness
+checking code exists, but only runs when `eval.py` is run deliberately, not on real
+usage. Wiring the same check into `answer_question()` itself (with, e.g., a bounded
+retry on failure) is the natural next step — and would also be a good first real use
+case for LangGraph, since "generate → check → conditionally retry" is a loop, not a
+straight-line chain.
 
-### 6. Broader language coverage for chunking
+### 4. Broader language coverage for chunking
 
 **The concept**: structure-aware chunking (§4 in Part 2) is only as broad as the parsers
 wired up for it. `tree-sitter-language-pack` (already a dependency here) ships grammars
@@ -358,7 +410,7 @@ node types to chunk types), not a new architectural problem.
 back to the generic character splitter (§4), with the same function-splitting risk that
 motivated building AST-based chunking in the first place.
 
-### 7. Productization (CLI)
+### 5. Productization (CLI)
 
 **The concept**: not a RAG concept specifically, but a systems one — a tool meant to be
 reused needs its varying inputs (which project to index, what question to ask) as
@@ -366,19 +418,22 @@ runtime arguments, not values edited into source code before every run.
 
 **Why it matters here**: `PROJECT_DIR` in `ingestion.py` is still a hardcoded path.
 
-### 8. The generator model itself is a ceiling
+### 6. The generator model itself is a ceiling
 
 **The concept**: retrieval quality has diminishing returns the moment the *generation*
 model is the weaker link — perfect context handed to a model that reasons poorly over
 it still produces a mediocre answer. This isn't something retrieval-side engineering can
 ever fix; it's a separate, orthogonal axis of quality (which model actually synthesizes
-the final answer).
+the final answer) — and it applies just as much to a model *judging* an answer as to the
+model that *wrote* it.
 
 **Why it matters here**: `llama3.2` run locally via Ollama is a small model relative to
 what a hosted/production system would typically use for final answer synthesis. Running
 fully local was a deliberate tradeoff in this project (no API keys, no data leaving the
 machine) — worth naming as a real limit on overall answer quality, not a bug to fix
-within the retrieval pipeline.
+within the retrieval pipeline. It's also, concretely, the reason the eval harness's own
+faithfulness judge (§12 in Part 2) isn't fully trustworthy yet — the same small model is
+being asked to grade its own kind of output.
 
 ---
 
@@ -394,13 +449,13 @@ within the retrieval pipeline.
 | Conversational query rewriting | ✅ Implemented | `app/rag/generate.py` |
 | Grounded generation / citation | ✅ Implemented | `generate.py` prompt |
 | Contextual chunk enrichment | ✅ Implemented | `chunk_documents.py` |
-| Index idempotency & stable IDs | ✅ Implemented (full-rebuild strategy) | `ingestion.py`, `chunk_documents.py` |
+| Index idempotency & stable IDs | ✅ Implemented | `ingestion.py`, `chunk_documents.py` |
 | Ingestion-time data governance | ✅ Implemented | `scan_project.py` |
+| Incremental indexing | ✅ Implemented | `ingestion.py`, `scan_project.py`, `manifest.py` |
+| Retrieval & generation evaluation | ✅ Implemented | `app/rag/eval.py` |
 | Multi-tenant / multi-project indexing | ❌ Not built | — |
-| Incremental indexing | ❌ Not built | — |
-| Retrieval & generation evaluation | ❌ Not built | — |
 | Observability / tracing | ❌ Not built | — |
-| Hallucination / faithfulness guardrails | ❌ Not built | — |
+| Hallucination guardrail at answer time | ❌ Not built (offline version exists in `eval.py`) | — |
 | Broader language chunking coverage | ❌ Not built | — |
 | CLI / productization | ❌ Not built | — |
 | Frontier-scale generator model | ❌ Deliberately not used (local-first tradeoff) | — |

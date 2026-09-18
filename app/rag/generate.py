@@ -181,32 +181,38 @@ Answer:
 # CHAT LOOP
 # ==================================================
 
-history = []
+def chat_loop():
 
-print(
-    "Codebase RAG - ask a question "
-    "(type 'exit' to quit)\n"
-)
-
-while True:
-
-    question = input("Question: ").strip()
-
-    if question.lower() in ("exit", "quit"):
-        break
-
-    if not question:
-        continue
-
-    answer = answer_question(history, question)
+    history = []
 
     print(
-        "\n========== ANSWER ==========\n"
+        "Codebase RAG - ask a question "
+        "(type 'exit' to quit)\n"
     )
 
-    print(answer)
+    while True:
 
-    print()
+        question = input("Question: ").strip()
 
-    history.append({"role": "user", "content": question})
-    history.append({"role": "assistant", "content": answer})
+        if question.lower() in ("exit", "quit"):
+            break
+
+        if not question:
+            continue
+
+        answer = answer_question(history, question)
+
+        print(
+            "\n========== ANSWER ==========\n"
+        )
+
+        print(answer)
+
+        print()
+
+        history.append({"role": "user", "content": question})
+        history.append({"role": "assistant", "content": answer})
+
+
+if __name__ == "__main__":
+    chat_loop()

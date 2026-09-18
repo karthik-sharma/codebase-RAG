@@ -7,18 +7,17 @@ def chunks_to_documents(chunks):
 
     for index, chunk in enumerate(chunks):
 
+        chunk_index = chunk.get("chunk_index", index)
+
         metadata = {
-            "chunk_id": f"{chunk['file']}:{index}",
+            "chunk_id": f"{chunk['file']}:{chunk_index}",
             "file": chunk["file"],
             "type": chunk["type"],
             "name": chunk["name"],
             "class": chunk["class"] or "",
             "start_line": chunk.get("start_line") or 0,
             "end_line": chunk.get("end_line") or 0,
-            "chunk_index": chunk.get(
-                "chunk_index",
-                index,
-            ),
+            "chunk_index": chunk_index,
         }
 
         # Prefix the file path so the embedding itself is aware

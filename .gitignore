@@ -12,3 +12,4 @@ wheels/
 # Generated RAG artifacts
 chroma_db/
 chunks.json
+index_manifest.json

@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 CHROMA_DIR = PROJECT_ROOT / "chroma_db"
 CHUNKS_FILE = PROJECT_ROOT / "chunks.json"
+MANIFEST_FILE = PROJECT_ROOT / "index_manifest.json"
 
 
 # ==================================================

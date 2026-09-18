@@ -15,10 +15,11 @@ that way.*
 7. [Deep dive: Storage](#7-deep-dive-storage)
 8. [Deep dive: Retrieval](#8-deep-dive-retrieval)
 9. [Deep dive: Generation](#9-deep-dive-generation)
-10. [Cross-cutting concepts](#10-cross-cutting-concepts)
-11. [Tech stack](#11-tech-stack--why-each-piece-is-there)
-12. [Bugs found and fixed (worth remembering)](#12-bugs-found-and-fixed-worth-remembering)
-13. [What's NOT built yet](#13-whats-not-built-yet)
+10. [Deep dive: Evaluation](#10-deep-dive-evaluation)
+11. [Cross-cutting concepts](#11-cross-cutting-concepts)
+12. [Tech stack](#12-tech-stack--why-each-piece-is-there)
+13. [Bugs found and fixed (worth remembering)](#13-bugs-found-and-fixed-worth-remembering)
+14. [What's NOT built yet](#14-whats-not-built-yet)
 
 ---
 
@@ -32,11 +33,15 @@ It runs **entirely locally**. No API keys, no data leaving your machine:
 - **Ollama** runs the embedding model and the chat model, both locally.
 - **Chroma** is a local, file-backed vector database (just a folder on disk: `chroma_db/`).
 
-There are two things you *do* with it:
+There are three things you *do* with it:
 - **`ingestion.py`** — point it at a project directory once (or whenever the code
-  changes), and it reads that project into a searchable index.
+  changes), and it reads that project into a searchable index. Safe to re-run any time —
+  it only re-processes what actually changed.
 - **`generate.py`** — an interactive terminal loop where you ask questions about
   whatever project was last ingested.
+- **`eval.py`** — runs a fixed set of test questions against the current index and
+  reports retrieval/answer-quality metrics, so a pipeline change can be judged
+  objectively instead of by eyeballing one query.
 
 ## 2. Glossary (terms used throughout)
 
@@ -78,6 +83,11 @@ If any of this project's vocabulary has gone rusty, start here.
   properly.
 - **Grounding** — instructing the LLM to answer *only* using the retrieved context, and
   not from what it happens to remember from training, to reduce made-up answers.
+- **Idempotent** — running an operation once, or a hundred times, leaves the system in
+  the same end state. Ingestion is designed to be idempotent.
+- **Manifest** — a small record of "what did we index last time, and what did it look
+  like" (here: a file-path → content-hash map), used to detect what's actually changed
+  since the last run.
 
 ## 3. The three-phase mental model
 
@@ -102,6 +112,80 @@ flowchart LR
     P2 --> P3
 ```
 
+### 3.1 — The complete flow, in full detail
+
+The diagram above is the mental model. This is what actually happens, file by file —
+every branch, every module, all three entry points (`ingestion.py`, `generate.py`,
+`eval.py`):
+
+```mermaid
+flowchart TD
+    subgraph ING["INGESTION — ingestion.py"]
+        direction TB
+        I0["run ingestion.py"] --> I1{"index_manifest.json exists?"}
+        I1 -->|"no"| I2["BOOTSTRAP mode"]
+        I1 -->|"yes"| I3["INCREMENTAL mode:\nload manifest + chunks.json"]
+        I2 --> I4["scan_project(): walk every file"]
+        I3 --> I4
+        I4 --> I5{"IGNORED_DIRS /\nIGNORED_FILES / .gitignore?"}
+        I5 -->|"skip"| I4
+        I5 -->|"keep"| I6{"incremental AND\nhash unchanged?"}
+        I6 -->|"yes"| I7["reuse previous chunks\n(no re-chunk, no re-embed)"]
+        I6 -->|"no / bootstrap"| I8["chunk_file():\nchunk_python_file /\nchunk_js_ts_file /\nchunk_text_file"]
+        I8 --> I9["assign chunk_index\n(0,1,2... per file)"]
+        I7 --> I10["all_chunks"]
+        I9 --> I10
+        I10 --> I11["write chunks.json"]
+        I2 -.-> I12["reset_collection()\n+ add_documents(all, ids=chunk_id)"]
+        I3 --> I13["diff manifest:\nchanged / new / deleted files"]
+        I13 --> I14["delete(ids=[old chunk_ids])\nfor changed + deleted files"]
+        I14 --> I15["add_documents(changed/new only,\nids=chunk_id)"]
+        I12 --> I16[("chroma_db/")]
+        I15 --> I16
+        I16 --> I17["write index_manifest.json"]
+    end
+
+    subgraph RET["RETRIEVAL — hybrid_search.py"]
+        direction TB
+        R1["question text"] --> R2["BM25Retriever\n(lexical, from chunks.json)"]
+        R1 --> R3["vector_store.as_retriever()\n(semantic, from Chroma)"]
+        R2 --> R4["EnsembleRetriever:\nReciprocal Rank Fusion\nweights [0.7, 0.3], merge by chunk_id"]
+        R3 --> R4
+        R4 --> R5["top CANDIDATE_POOL_SIZE=10\ncandidates"]
+        R5 --> R6["CrossEncoderReranker\n(ms-marco-MiniLM-L-6-v2)"]
+        R6 --> R7["final top_k results"]
+    end
+
+    subgraph GEN["GENERATION — generate.py (chat_loop)"]
+        direction TB
+        G0["user types a question"] --> G1{"history non-empty?"}
+        G1 -->|"yes"| G2["rewrite_standalone_question()\nvia ChatOllama"]
+        G1 -->|"no"| G3["use question as-is"]
+        G2 --> G4["standalone question"]
+        G3 --> G4
+        G4 --> R1
+        R7 --> G5["build_context()"]
+        G5 --> G6["assemble grounded prompt\n(cite every file, no invention)"]
+        G6 --> G7["ChatOllama.invoke()\nwith full running history"]
+        G7 --> G8["print answer"]
+        G8 --> G9["append Q+A to history"]
+        G9 -.next turn.-> G0
+    end
+
+    subgraph EVAL["EVALUATION — eval.py"]
+        direction TB
+        E1["EVAL_CASES:\nquestion + expected_files"] --> R1
+        R7 --> E2["retrieval_metrics():\nHit Rate, Precision, Recall, MRR"]
+        E1 --> E3["answer_question()\n(reused from generate.py)"]
+        E3 --> E4["faithfulness_check():\nLLM-as-judge via ChatOllama"]
+        E2 --> E5["SUMMARY table"]
+        E4 --> E5
+    end
+
+    I16 -.read by.-> R3
+    I11 -.read by.-> R2
+```
+
 **Ingestion happens once (or whenever code changes).** Retrieval and generation happen
 **every single time you ask a question**, always operating on whatever was last ingested.
 Retrieval can never be better than the chunks ingestion produced — if a chunk was never
@@ -117,12 +201,13 @@ ollama pull llama3.2
 ```
 
 **Step 1 — ingest a project** (edit `PROJECT_DIR` in `app/rag/ingestion.py` first, it's
-currently hardcoded — see [§13](#13-whats-not-built-yet)):
+currently hardcoded — see [§14](#14-whats-not-built-yet)):
 ```bash
 uv run app/rag/ingestion.py
 ```
-This reads every file under `PROJECT_DIR`, chunks it, and (re)builds the Chroma index at
-`chroma_db/`, plus a debug dump at `chunks.json`.
+This reads every file under `PROJECT_DIR`, chunks whatever changed since the last run,
+and updates the Chroma index at `chroma_db/`, plus a debug dump at `chunks.json` and a
+change-tracking `index_manifest.json`. Safe to run repeatedly — see [§6](#6-deep-dive-ingestion).
 
 **Step 2 — ask questions about it:**
 ```bash
@@ -130,6 +215,12 @@ uv run app/rag/generate.py
 ```
 Drops you into a `Question:` loop. Type `exit` or `quit` to leave. Follow-up questions
 work — you don't need to re-state context each time (see [§9](#9-deep-dive-generation)).
+
+**Step 3 (optional) — measure retrieval/answer quality:**
+```bash
+uv run app/rag/eval.py
+```
+Runs a fixed set of test questions and prints metrics — see [§10](#10-deep-dive-evaluation).
 
 ## 5. Deep dive: Chunking
 
@@ -145,12 +236,13 @@ because there was never a good "unit" to find in the first place.
 
 | File | What it does |
 |---|---|
-| `scan_project.py` | Walks the whole project directory tree; decides what to skip; dispatches each remaining file to the right chunker below. |
+| `scan_project.py` | Walks the whole project directory tree; decides what to skip; dispatches each remaining file to the right chunker below; drives both full and incremental scans (see [§6](#6-deep-dive-ingestion)). |
 | `file_support.py` | Maps a file's extension to a `file_type` string (`"python"`, `"javascript"`, `"config"`, etc.) that `scan_project.py` uses to pick a chunker. Also defines the ignore lists. |
 | `chunk_python_file.py` | Chunks `.py` files. |
 | `chunk_js_ts_file.py` | Chunks `.js`/`.jsx`/`.ts`/`.tsx` files. |
 | `text_chunker.py` | Fallback for everything else (HTML/CSS/JSON/YAML/TOML/Markdown/plain text). |
 | `chunk_documents.py` | Converts the raw chunk dicts produced above into the `Document` objects the rest of the pipeline (storage, retrieval) actually consumes. Covered in [§7](#7-deep-dive-storage) since it's really the ingestion→storage bridge. |
+| `manifest.py` | Content-hashing and manifest load/save, used to detect which files actually changed between ingestion runs. Covered in [§6](#6-deep-dive-ingestion). |
 
 ### 5.1 — Deciding what to skip (`scan_project.py`)
 
@@ -195,7 +287,8 @@ recursing into nested/inner functions) and produces one chunk per:
   → `type: "imports"`
 
 Each chunk carries: `code` (the exact source text), `file`, `type`, `name`, `class`,
-`start_line`, `end_line`.
+`start_line`, `end_line`. A `chunk_index` (this chunk's position within *its own file*,
+starting at 0) is assigned afterward, centrally, by `scan_project.py` — see [§6](#6-deep-dive-ingestion).
 
 **Why group imports into one chunk instead of ignoring them or chunking them
 individually**: originally imports weren't chunked *at all* (the walker only matched
@@ -258,39 +351,84 @@ will cut one in half as readily as anywhere else.
 
 ## 6. Deep dive: Ingestion
 
-**What**: the one-time (or run-when-code-changes) process that turns a project directory
-into a searchable index.
+**What**: the process that turns a project directory into a searchable index, and keeps
+it in sync as the project changes — **without** re-embedding the entire project every
+single time.
 
-**Where**: `app/rag/ingestion.py` (the orchestrator — deliberately thin, everything it
-calls lives in a dedicated module)
+**Where**: `app/rag/ingestion.py` (the orchestrator), `chunking_strategy/scan_project.py`
+(the scan itself), `chunking_strategy/manifest.py` (change detection).
 
-**How**, in order:
-1. `scan_project(PROJECT_DIR)` → runs everything in [§5](#5-deep-dive-chunking), returns
-   a flat list of raw chunk dicts.
-2. That list is dumped to `chunks.json` at the project root — a debugging/inspection
-   aid, and also (importantly) **the exact same data source the retrieval layer's BM25
-   index gets rebuilt from** — see [§8](#8-deep-dive-retrieval).
-3. `chunks_to_documents(chunks)` converts each raw dict into a LangChain `Document` —
-   covered in [§7](#7-deep-dive-storage), since this is really the seam between chunking
-   and storage.
-4. `vector_store.reset_collection()` — **deletes and recreates the entire Chroma
-   collection** before adding anything.
-5. `vector_store.add_documents(documents)` — embeds every document (via Ollama's
-   `nomic-embed-text` model, under the hood of `OllamaEmbeddings`) and stores the result
-   in Chroma.
+### 6.1 — Bootstrap vs. incremental
 
-**Why step 4 (reset before add) matters — this was a real bug**: `add_documents`, on its
-own, has no notion of "this chunk already exists, update it" — it just adds. Run
-`ingestion.py` twice on the same project without the reset, and every chunk exists
-**twice** in the index (with two different auto-generated internal IDs), silently
-degrading retrieval quality more each time you re-ingest. The reset makes ingestion
-**idempotent**: run it once or run it fifty times, the resulting index is identical
-either way — always a fresh, complete rebuild, never an accumulation.
+Every run starts by checking whether `index_manifest.json` exists:
 
-**Known limitation this creates**: because there's only **one** Chroma collection
-(named `"codebase"`) for the *entire tool*, `reset_collection()` wipes out whatever
-project was previously ingested too. Ingesting Project B currently destroys Project A's
-index. See [§13](#13-whats-not-built-yet).
+- **No manifest found → bootstrap run.** Nothing to diff against, so the whole project
+  is scanned and chunked from scratch, `vector_store.reset_collection()` wipes the Chroma
+  collection first, and everything gets added fresh. This also doubles as a **migration
+  path**: an index built before incremental indexing existed used a different, unstable
+  chunk-ID scheme (see [§13](#13-bugs-found-and-fixed-worth-remembering), bug #10) — the
+  first bootstrap run after that scheme changed automatically replaces it with a correct
+  one, with no manual cleanup needed.
+- **Manifest found → incremental run.** Only files that actually changed get re-chunked
+  and re-embedded; everything else is left alone.
+
+### 6.2 — How incremental detection works
+
+**How**: `scan_project()` (in `scan_project.py`) takes an optional `previous_manifest`
+(`{file_path: content_hash}`, SHA-256) and `previous_chunks_by_file`. For every file it
+encounters during its walk:
+- Hash the file's current content.
+- If that hash matches what's in `previous_manifest` → **skip re-chunking entirely**,
+  reuse the chunks already recorded for that file from `previous_chunks_by_file`.
+- Otherwise (new file, or hash differs) → **re-chunk it** via the normal dispatch
+  ([§5](#5-deep-dive-chunking)), and assign each of its chunks a `chunk_index` (0, 1, 2...
+  — its position *within that file's own chunk list*, not a global position — see
+  [§7](#7-deep-dive-storage) for why this distinction matters).
+
+After the walk, any file present in `previous_manifest` but never encountered this time
+is reported as **deleted**.
+
+`scan_project()` returns `(all_chunks, manifest, deleted_files)` — `all_chunks` is
+*every* currently-valid chunk (reused + freshly chunked), `manifest` is this run's fresh
+`{file: hash}` map, and it's `ingestion.py`'s job to figure out what to actually do about
+Chroma with that information.
+
+### 6.3 — Updating Chroma without a full rebuild
+
+**How** (`ingestion.py`, incremental branch): compare the new `manifest` against
+`previous_manifest` to get `changed_or_new_files`. Union that with `deleted_files` to get
+every file whose *old* chunks are now stale. For each of those files, look up its old
+chunks (from `previous_chunks_by_file`) and compute their `chunk_id`s
+(`f"{file}:{chunk_index}"`) — those get passed to `vector_store.delete(ids=...)`. Then
+the freshly (re)chunked chunks (only from `changed_or_new_files`, since unchanged files'
+embeddings are still correct and untouched) get converted to `Document`s and added via
+`vector_store.add_documents(documents, ids=[...])`.
+
+**Why `ids=` has to be passed explicitly — this was a real bug found while building
+this**: `Chroma.add_documents()` auto-generates a random UUID for every document unless
+you hand it explicit IDs. Deleting later by our own `chunk_id` strings silently deletes
+*nothing*, because Chroma's real internal IDs were never our `chunk_id`s at all — they
+were random UUIDs the whole time. This had been invisible until now because the old
+full-rebuild strategy never needed to delete anything by ID — it just wiped the whole
+collection. The instant "delete this file's old chunks, keep everything else" was
+required, the gap became a real, load-bearing bug rather than a harmless inconsistency.
+Fixed by passing `ids=[doc.metadata["chunk_id"] for doc in documents]` on every
+`add_documents()` call, so Chroma's real ID and our `chunk_id` are now the same string.
+
+### 6.4 — What gets written every run
+
+1. `chunks.json` — the *complete* current chunk list (reused + fresh), same as before.
+2. `index_manifest.json` — this run's `{file: hash}` map, for next time's diff.
+
+**Why incremental indexing needed the `chunk_index` fix first**: before this feature,
+`chunk_id` was computed as `f"{file}:{global list position}"` — global across *every*
+file combined, not scoped to one file. That's harmless under a full-rebuild-only
+strategy (everything's always recomputed together, so global consistency holds), but it
+breaks incremental indexing outright: if file A's chunk count changes, every later file's
+IDs would silently shift, making "delete just this file's old chunks" impossible to do
+correctly. Fixing `chunk_id` to be per-file-stable (`chunk_index` reset to 0 for each
+file, assigned once in `scan_project.py`, reused everywhere) was a prerequisite, done as
+part of this change — see `chunk_documents.py`, [§7](#7-deep-dive-storage).
 
 ## 7. Deep dive: Storage
 
@@ -300,8 +438,8 @@ project.
 
 **Where**: `app/rag/store.py`
 
-**How**: three things, defined once:
-- `PROJECT_ROOT`, `CHROMA_DIR`, `CHUNKS_FILE` — computed via
+**How**: defined once:
+- `PROJECT_ROOT`, `CHROMA_DIR`, `CHUNKS_FILE`, `MANIFEST_FILE` — computed via
   `Path(__file__).resolve().parents[2]`, i.e. anchored to *this file's own location on
   disk*, not to whatever directory the script happens to be run from (`cwd`).
 - `embeddings` — an `OllamaEmbeddings(model="nomic-embed-text")` instance.
@@ -323,17 +461,22 @@ file's own on-disk location makes both always agree, regardless of where you run
 script from.
 
 **Also inside the chunking→storage seam** (`chunking_strategy/chunk_documents.py`,
-called from both `ingestion.py` and `hybrid_search.py`):
-- Computes a **stable `chunk_id`**: `f"{chunk['file']}:{index}"` — the chunk's position
-  in the list, combined with its source file. This one string is what lets a chunk
-  produced by ingestion, a chunk found by the BM25 retriever, and a chunk found by the
-  vector retriever all be recognized as "the same chunk" later during retrieval merging
-  — see [§8](#8-deep-dive-retrieval) and the bug note in [§12](#12-bugs-found-and-fixed-worth-remembering).
+called from `ingestion.py`, `hybrid_search.py`, and `eval.py`):
+- Computes a **stable `chunk_id`**: `f"{chunk['file']}:{chunk_index}"`, where
+  `chunk_index` is the chunk's position *within its own file's chunk list* (assigned once
+  in `scan_project.py`, carried through `chunks.json`) — **not** its position in
+  whatever larger list happens to be passed to `chunks_to_documents()` at the time. This
+  distinction is what makes the ID stable across incremental re-indexing (§6.4) — a
+  chunk's ID never changes just because some *other*, unrelated file gained or lost a
+  chunk. This one string is what lets a chunk produced by ingestion, a chunk found by the
+  BM25 retriever, and a chunk found by the vector retriever all be recognized as "the
+  same chunk" later during retrieval merging — see [§8](#8-deep-dive-retrieval) and the
+  bug notes in [§13](#13-bugs-found-and-fixed-worth-remembering).
 - Prefixes the text that actually gets embedded with `File: {path}\n\n` before the
   code — so the *embedding itself* (not just metadata sitting alongside it) is aware of
   which file/directory a chunk came from. This is what makes a query like "what do we
   import in **backend** files" actually favor backend files semantically, not just
-  lexically — see [§10](#10-cross-cutting-concepts).
+  lexically — see [§11](#11-cross-cutting-concepts).
 
 ## 8. Deep dive: Retrieval
 
@@ -379,6 +522,13 @@ be the closest *semantic* match to anything); keyword-only search misses paraphr
 questions that don't share the code's exact vocabulary. Each covers the other's blind
 spot.
 
+**A real, known gap this surfaced** (found via the eval harness, [§10](#10-deep-dive-evaluation)):
+a query like "what does the login function do?" can retrieve *frontend* `Login.jsx`/
+`Login.css`/`App.jsx` instead of the backend `app.py` function that actually implements
+login — "login" is semantically and lexically close to those frontend filenames/component
+names too, and nothing currently disambiguates "the concept of logging in" from "files
+whose name/UI text says Login." Not fixed yet — recorded as a finding, not a fix.
+
 ## 9. Deep dive: Generation
 
 **What**: turning (question + retrieved chunks) into an actual grounded, cited answer —
@@ -386,7 +536,10 @@ and doing that across a multi-turn conversation, not just one isolated question.
 
 **Where**: `app/rag/generate.py`
 
-**How**: an `input()` loop (`Question: `, type `exit`/`quit` to stop) that, each turn:
+**How**: `chat_loop()` (an `input()` loop — `Question: `, type `exit`/`quit` to stop,
+guarded behind `if __name__ == "__main__":` so the rest of the module — `answer_question`,
+`build_context`, `llm` — can be safely imported elsewhere, e.g. by `eval.py`, without
+that loop hijacking the import) that, each turn:
 
 1. **Rewrites the question if there's history** (`rewrite_standalone_question`) — sends
    the conversation so far plus the new (possibly vague) question to `ChatOllama`, asking
@@ -420,22 +573,71 @@ point of supporting a conversation at all.
 answer) instead of one — a real latency tradeoff, accepted because a fast wrong retrieval
 is worse than a slower correct one.
 
-## 10. Cross-cutting concepts
+## 10. Deep dive: Evaluation
+
+**What**: objectively measuring retrieval and answer quality against a fixed test set,
+instead of eyeballing one or two manually-typed queries (which is how every prior change
+in this project was validated, including the BM25/reranking swap — that approach can
+show something improved on the one example you tried, but can never show it didn't
+regress something else, and can't be re-run automatically).
+
+**Where**: `app/rag/eval.py`
+
+**How**: `EVAL_CASES` is a fixed list of `{question, expected_files}` pairs against the
+currently-ingested project (`expected_files` are path *substrings*, e.g. `"Backend/app.py"`,
+matched against each retrieved chunk's absolute path — kept as substrings rather than
+exact paths so the eval set stays portable across machines/checkouts). For each case:
+
+- **Retrieval metrics** — run `hybrid_search()` directly and compare the retrieved files
+  against `expected_files`:
+  - **Hit Rate** — did *any* expected file appear anywhere in the top-k? (0 or 1)
+  - **Precision** — of the top-k retrieved, what fraction were actually relevant?
+  - **Recall** — of all the expected files, what fraction were found in the top-k?
+  - **MRR (Mean Reciprocal Rank)** — `1 / rank of the first relevant result` (0 if none
+    found) — rewards the correct chunk appearing *early*, not just present somewhere.
+- **Faithfulness (LLM-as-judge)** — runs the real `answer_question([], question, top_k)`
+  from `generate.py` (empty history — eval questions are one-shot, not conversational),
+  then makes a *separate* LLM call: "is every claim in this answer supported by this
+  context — yes/no, and which claims aren't." This is a genuinely different use of the
+  same idea as the not-yet-built hallucination guardrail ([§14](#14-whats-not-built-yet)) —
+  here it's an *offline scoring signal*, there it would be a *runtime* check; the
+  mechanism is reusable for both.
+
+Prints per-question results plus a final summary table (Hit Rate/Precision/Recall/MRR/
+Faithfulness, averaged across all cases).
+
+**A real, known limitation this surfaced**: the faithfulness judge itself is not fully
+reliable at this model scale. In one run, it flagged an answer as unfaithful because
+"the context doesn't contain the word 'autoincrement'" — when the underlying code chunk
+genuinely did contain that exact text. `llama3.2` acting as its own judge can misread the
+very context it's given, which means a low faithfulness score from this check should be
+treated as a signal worth a human glance, not an automatic verdict.
+
+## 11. Cross-cutting concepts
 
 A few things don't belong to just one phase — they're properties of the system as a
 whole.
 
 **Idempotent ingestion** — covered in [§6](#6-deep-dive-ingestion). Re-running ingestion
-always produces the same end state, never an accumulation.
+always converges to the same correct end state, whether nothing changed, one file
+changed, or the whole project changed — never an accumulation, and (as of incremental
+indexing) never redundant work either.
 
 **Stable chunk identity (`chunk_id`)** — covered in [§7](#7-deep-dive-storage). The same
-`file:index` string is used in `chunks.json`, in Chroma's metadata, and in the BM25
-index, so results from different retrieval paths reliably refer to "the same chunk" when
-merged. This was a real, silent bug before it was fixed: the keyword-search code path
-originally built its `chunk_id` from `file:name` while the semantic path used
-`file:index` — the two virtually never matched, so keyword hits almost never actually
-reinforced a semantic hit's score, quietly undermining the entire point of "hybrid"
-search without erroring or looking obviously wrong.
+`file:chunk_index` string (chunk_index scoped to its own file, not global) is used in
+`chunks.json`, in Chroma's actual document IDs, and in the BM25 index, so results from
+different retrieval paths reliably refer to "the same chunk" when merged, and so a single
+file's chunks can be safely deleted/replaced without disturbing any other file's chunks.
+This was a real, silent bug before it was fixed — twice, in two different ways:
+1. The keyword-search code path originally built its `chunk_id` from `file:name` while
+   the semantic path used `file:index` — the two virtually never matched, so keyword hits
+   almost never actually reinforced a semantic hit's score, quietly undermining the
+   entire point of "hybrid" search without erroring or looking obviously wrong.
+2. `chunk_id` was later made consistent between the two paths, but was still computed as
+   a *global* list position rather than a *per-file* one — harmless under a
+   full-rebuild-only ingestion strategy, but silently wrong the moment incremental
+   indexing needed to target "just this one file's chunks" for deletion. Fixed alongside
+   incremental indexing, [§6.4](#64--what-gets-written-every-run).
 
 **Path-aware retrieval** — a question mentioning "backend" or "frontend" needs the file's
 *location*, not just its code content, to matter to retrieval. Fixed in two places at
@@ -455,7 +657,7 @@ through the raw `ollama` Python client while embeddings went through LangChain's
 — two different clients talking to the same local Ollama server for no functional reason.
 Consolidated onto one.
 
-## 11. Tech stack — why each piece is there
+## 12. Tech stack — why each piece is there
 
 | Dependency | Role |
 |---|---|
@@ -470,12 +672,13 @@ Consolidated onto one.
 | `pathspec` | Correct `.gitignore`-style pattern matching (real gitwildmatch semantics), used for security-aware ingestion. |
 | `sentence-transformers` (pulls in `torch`, `transformers`) | Runs the local cross-encoder reranking model. By far the heaviest dependency in this project — a deliberate tradeoff for real reranking quality over a local-first project's usual "stay light" bias. |
 
-## 12. Bugs found and fixed (worth remembering)
+## 13. Bugs found and fixed (worth remembering)
 
-These were each real, silent failures discovered by actually running queries and
-noticing wrong-looking results — not caught by any test, because none existed at the
-time. Worth remembering *why* each fix exists, so a future refactor doesn't accidentally
-reintroduce them:
+These were each real, silent failures discovered by actually running queries (or, later,
+by actually testing the incremental-indexing/eval code paths directly) and noticing
+wrong-looking results — not caught by any test at the time it was introduced. Worth
+remembering *why* each fix exists, so a future refactor doesn't accidentally reintroduce
+them:
 
 1. **Relative import paths broke package structure** — `scan_project.py` used bare
    imports (`from text_chunker import ...`) that only work if run as a top-level script
@@ -487,11 +690,13 @@ reintroduce them:
 3. **`chunks.json` never actually loaded** — the load code in `hybrid_search.py` was
    commented out, so the module-level `chunks` variable used by keyword search didn't
    exist at all.
-4. **Duplicate ingestion** — see [§6](#6-deep-dive-ingestion), fixed with
-   `reset_collection()`.
-5. **`chunk_id` scheme mismatch** — see [§10](#10-cross-cutting-concepts), the
-   keyword-search path computed a different `chunk_id` format than the semantic path,
-   so hybrid merging silently barely did anything.
+4. **Duplicate ingestion** — see [§6](#6-deep-dive-ingestion), originally fixed with
+   `reset_collection()` (full wipe-and-rebuild); later replaced by real incremental
+   add/delete once chunk IDs became stable enough to support it.
+5. **`chunk_id` scheme mismatch (semantic vs. keyword path)** — see
+   [§11](#11-cross-cutting-concepts), the keyword-search path computed a different
+   `chunk_id` format than the semantic path, so hybrid merging silently barely did
+   anything.
 6. **Import statements never chunked** — see [§5.2](#52--python-chunking-chunkpythonfilepy).
    A "what does this file import" question had zero retrievable content, not a bad
    answer — an *empty* one.
@@ -500,33 +705,46 @@ reintroduce them:
    code for any query mentioning "library"/"package".
 8. **Retrieval blind to file paths** — a query saying "backend" had zero influence on
    ranking, since neither keyword matching nor the embedded text ever looked at *where* a
-   chunk lived, only its code content. Fixed per [§10](#10-cross-cutting-concepts).
+   chunk lived, only its code content. Fixed per [§11](#11-cross-cutting-concepts).
 9. **No `.gitignore` awareness** — see [§5.1](#51--deciding-what-to-skip-scanprojectpy).
+10. **`chunk_id` scheme was global, not per-file** — see
+    [§11](#11-cross-cutting-concepts) and [§6.4](#64--what-gets-written-every-run).
+    Harmless under full-rebuild-only ingestion, but would have silently broken
+    incremental indexing (shifting IDs whenever an unrelated file's chunk count changed)
+    had it not been fixed first.
+11. **`add_documents()` ignored our `chunk_id` unless told to use it** — see
+    [§6.3](#63--updating-chroma-without-a-full-rebuild). Chroma auto-generates random
+    UUIDs as real document IDs unless `ids=` is passed explicitly; deleting later by our
+    own `chunk_id` strings matched nothing. Invisible under the old full-wipe strategy;
+    a real, blocking bug the moment targeted deletes were needed. Caught by writing an
+    actual test for the incremental add/delete behavior, not by inspection.
 
-## 13. What's NOT built yet
+## 14. What's NOT built yet
 
 In rough priority order (highest-impact/highest-risk first):
 
 1. **No CLI** — `PROJECT_DIR` in `ingestion.py` is still a hardcoded path; must be edited
    by hand to index a different project.
 2. **Single shared Chroma collection** — there's only ever one collection
-   (`"codebase"`); ingesting a second project currently wipes the first project's index
-   entirely, since `reset_collection()` clears the only collection that exists. This is
-   the most important structural limitation to fix before this tool could handle "index
-   multiple repos."
-3. **No incremental indexing** — every ingestion run re-embeds the *entire* project from
-   scratch, even if only one file changed.
-4. **No evaluation harness** — no fixed set of `(question, expected file)` test pairs to
-   objectively measure whether a change (e.g. the BM25/reranking swap) actually improved
-   retrieval, versus just eyeballing one or two manual queries.
-5. **No local observability/logging** — no persisted record of past queries, what was
+   (`"codebase"`); ingesting a second project currently mixes its chunks into the same
+   index as the first (and a bootstrap run on that second project would wipe the first
+   project's index entirely, via `reset_collection()`). This is the most important
+   structural limitation to fix before this tool could handle "index multiple repos."
+3. **No local observability/logging** — no persisted record of past queries, what was
    retrieved, or what was answered, for later inspection.
-6. **No hallucination/faithfulness guardrail** — the prompt *asks* the model to stay
-   grounded in context, but nothing actually verifies it did.
-7. **Only Python and JS/TS get real AST-based chunking** — every other language (Go,
+4. **No hallucination/faithfulness guardrail at *answer time*** — `eval.py` ([§10](#10-deep-dive-evaluation))
+   added an *offline* faithfulness check, but nothing checks this live, during a real
+   `generate.py` session — the prompt *asks* the model to stay grounded, but nothing
+   verifies it did, in the moment it matters.
+5. **Only Python and JS/TS get real AST-based chunking** — every other language (Go,
    Rust, Java, etc.) would currently fall back to the generic character splitter.
-8. **The generation model itself is a real ceiling** — `llama3.2` run locally is a small
+6. **The generation model itself is a real ceiling** — `llama3.2` run locally is a small
    model compared to what a production system would put behind this much retrieval
    engineering. No amount of retrieval-side work fixes weak final-answer reasoning; that
    tradeoff was made deliberately in favor of staying fully local, but it's worth naming
-   as a limit, not something the pipeline could ever "solve."
+   as a limit, not something the pipeline could ever "solve." It's also the same
+   limitation behind the eval harness's faithfulness judge being unreliable ([§10](#10-deep-dive-evaluation)) —
+   a small local model judging its own output has the same ceiling as a small local model
+   generating that output in the first place.
+7. **Known retrieval gap: "login" (concept) vs. `Login.jsx`/`Login.css` (filenames)** —
+   found via the eval harness, see [§8](#8-deep-dive-retrieval). Not yet fixed.
